@@ -39,6 +39,7 @@ import me.shedaniel.math.Point;
 import me.shedaniel.rei.api.client.REIRuntime;
 import me.shedaniel.rei.api.client.config.ConfigObject;
 import me.shedaniel.rei.api.client.entry.filtering.FilteringRuleTypeRegistry;
+import me.shedaniel.rei.api.client.gui.config.ForceLocalRecipesMode;
 import me.shedaniel.rei.api.client.entry.renderer.EntryRenderer;
 import me.shedaniel.rei.api.client.favorites.FavoriteEntry;
 import me.shedaniel.rei.api.client.favorites.FavoriteEntryType;
@@ -61,6 +62,7 @@ import me.shedaniel.rei.api.common.registry.ReloadStage;
 import me.shedaniel.rei.api.common.util.CollectionUtils;
 import me.shedaniel.rei.api.common.util.EntryStacks;
 import me.shedaniel.rei.impl.ClientInternals;
+import me.shedaniel.rei.impl.Internals;
 import me.shedaniel.rei.impl.client.ClientHelperImpl;
 import me.shedaniel.rei.impl.client.REIRuntimeImpl;
 import me.shedaniel.rei.impl.client.config.ConfigManagerImpl;
@@ -76,6 +78,7 @@ import me.shedaniel.rei.impl.client.gui.widget.QueuedTooltip;
 import me.shedaniel.rei.impl.client.gui.widget.TooltipContextImpl;
 import me.shedaniel.rei.impl.client.gui.widget.search.OverlaySearchField;
 import me.shedaniel.rei.impl.client.registry.category.CategoryRegistryImpl;
+import me.shedaniel.rei.impl.client.registry.display.ClientRecipeFallback;
 import me.shedaniel.rei.impl.client.registry.display.DisplayRegistryImpl;
 import me.shedaniel.rei.impl.client.registry.screen.ScreenRegistryImpl;
 import me.shedaniel.rei.impl.client.search.SearchProviderImpl;
@@ -92,6 +95,7 @@ import me.shedaniel.rei.impl.common.entry.type.types.EmptyEntryDefinition;
 import me.shedaniel.rei.impl.common.networking.DisplaySyncPacket;
 import me.shedaniel.rei.impl.common.plugins.PluginManagerImpl;
 import me.shedaniel.rei.impl.common.plugins.ReloadManagerImpl;
+import me.shedaniel.rei.impl.common.registry.displays.ServerDisplayRegistryImpl;
 import me.shedaniel.rei.impl.common.util.InstanceHelper;
 import me.shedaniel.rei.impl.common.util.IssuesDetector;
 import me.shedaniel.rei.plugin.test.REITestCommonPlugin;
@@ -99,6 +103,9 @@ import me.shedaniel.rei.plugin.test.REITestPlugin;
 import net.fabricmc.api.EnvType;
 import net.fabricmc.api.Environment;
 import net.minecraft.client.Minecraft;
+import net.minecraft.client.multiplayer.ClientPacketListener;
+import net.minecraft.util.context.ContextMap;
+import net.minecraft.world.item.crafting.display.SlotDisplayContext;
 import net.minecraft.client.gui.components.EditBox;
 import net.minecraft.client.gui.components.ImageButton;
 import net.minecraft.client.gui.components.events.GuiEventListener;
@@ -135,6 +142,19 @@ public class RoughlyEnoughItemsCoreClient {
     
     public static void attachClientInternals() {
         InternalWidgets.attach();
+        Internals.attachInstance((Supplier<ContextMap>) () -> {
+            Minecraft client = Minecraft.getInstance();
+            if (client.level != null) {
+                return SlotDisplayContext.fromLevel(client.level);
+            }
+            ContextMap.Builder builder = new ContextMap.Builder()
+                    .withParameter(SlotDisplayContext.REGISTRIES, Internals.getRegistryAccess());
+            ClientPacketListener connection = client.getConnection();
+            if (connection != null) {
+                builder.withParameter(SlotDisplayContext.FUEL_VALUES, connection.fuelValues());
+            }
+            return builder.create(SlotDisplayContext.CONTEXT);
+        }, "slotDisplayContext");
         EmptyEntryDefinition.EmptyRenderer emptyEntryRenderer = new EmptyEntryDefinition.EmptyRenderer();
         ClientInternals.attachInstance((Supplier<EntryRenderer<?>>) () -> emptyEntryRenderer, "emptyEntryRenderer");
         ClientInternals.attachInstance((BiFunction<Supplier<DataResult<FavoriteEntry>>, Supplier<CompoundTag>, FavoriteEntry>) DelegatingFavoriteEntryProviderImpl::new, "delegateFavoriteEntry");
@@ -239,7 +259,7 @@ public class RoughlyEnoughItemsCoreClient {
             ItemStack stack = buf.readLenientJsonWithCodec(ItemStack.OPTIONAL_CODEC);
             String player = buf.readUtf(32767);
             if (client.player != null) {
-                client.player.displayClientMessage(Component.literal(I18n.get("text.rei.cheat_items").replaceAll("\\{item_name}", EntryStacks.of(stack.copy()).asFormattedText().getString()).replaceAll("\\{item_count}", stack.copy().getCount() + "").replaceAll("\\{player_name}", player)), false);
+                client.player.sendSystemMessage(Component.literal(I18n.get("text.rei.cheat_items").replaceAll("\\{item_name}", EntryStacks.of(stack.copy()).asFormattedText().getString()).replaceAll("\\{item_count}", stack.copy().getCount() + "").replaceAll("\\{player_name}", player)));
             }
         });
         NetworkManager.registerReceiver(NetworkManager.s2c(), RoughlyEnoughItemsNetwork.NOT_ENOUGH_ITEMS_PACKET, (buf, context) -> {
@@ -272,7 +292,15 @@ public class RoughlyEnoughItemsCoreClient {
                 }*/
             }
         });
-        NetworkManager.registerReceiver(NetworkManager.s2c(), DisplaySyncPacket.TYPE, DisplaySyncPacket.STREAM_CODEC, List.of(new SplitPacketTransformer()), DisplaySyncPacket::handle);
+        NetworkManager.registerReceiver(NetworkManager.s2c(), DisplaySyncPacket.TYPE, DisplaySyncPacket.STREAM_CODEC, List.of(new SplitPacketTransformer()), (payload, context) -> {
+            ClientRecipeFallback.onServerDisplaySync();
+            if (ConfigObject.getInstance().getForceLocalRecipes() == ForceLocalRecipesMode.ALWAYS && !Minecraft.getInstance().isLocalServer()) {
+                // Local recipes take precedence in ALWAYS mode; ignore the server's display sync.
+                InternalLogger.getInstance().info("[Local Recipes] Ignoring server display sync because local recipes mode is ALWAYS.");
+                return;
+            }
+            payload.handle(context);
+        });
     }
     
     private void loadTestPlugins() {
@@ -320,26 +348,30 @@ public class RoughlyEnoughItemsCoreClient {
             if (ClientHelperImpl.getInstance().canUsePackets()) {
                 return;
             }
-            
+
             InternalLogger.getInstance().debug("Received server's request to add %d recipes.", entries.size());
             DisplayRegistryImpl registry = (DisplayRegistryImpl) DisplayRegistry.getInstance();
             List<RecipeDisplayEntry> mapped = CollectionUtils.map(entries, ClientboundRecipeBookAddPacket.Entry::contents);
+            // Record the server-advertised ids so the local fallback can dedup against them.
+            ClientRecipeFallback.onServerRecipeBookAdd(CollectionUtils.map(mapped, RecipeDisplayEntry::id));
             registry.addJob(() -> registry.addRecipes(mapped));
         });
         ClientRecipeUpdateEvent.REMOVE.register((recipeAccess, entries) -> {
             if (ClientHelperImpl.getInstance().canUsePackets()) {
                 return;
             }
-            
+
             InternalLogger.getInstance().debug("Received server's request to remove %d recipes.", entries.size());
             DisplayRegistryImpl registry = (DisplayRegistryImpl) DisplayRegistry.getInstance();
             Set<RecipeDisplayId> ids = new HashSet<>(entries);
+            ClientRecipeFallback.onServerRecipeBookRemove(ids);
             registry.addJob(() -> registry.removeRecipes(ids));
         });
         ClientPlayerEvent.CLIENT_PLAYER_QUIT.register(player -> {
             InternalLogger.getInstance().debug("Player quit, clearing reload tasks!");
             endReload.setValue(-1);
             ReloadManagerImpl.terminateReloadTasks();
+            ClientRecipeFallback.reset();
         });
         ClientGuiEvent.INIT_PRE.register((screen, access) -> {
             List<ReloadStage> stages = ((PluginManagerImpl<REICommonPlugin>) PluginManager.getInstance()).getObservedStages();
